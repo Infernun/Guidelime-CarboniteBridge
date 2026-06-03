@@ -1,15 +1,16 @@
 --[[
-Guidelime_CarboniteBridge.lua v5
+Guidelime_CarboniteBridge.lua v6
 
 Objetivo:
   Mostrar en el mapa de Carbonite los marcadores numerados de pasos de Guidelime
   que aparecen en el mapa original de World of Warcraft Classic/TBC.
 
-Cambios v5:
-  - Nuevo /glcarb arrowsize <multiplicador> para ajustar solo la flecha/primer
-    punto activo de Guidelime sin cambiar los pasos numerados.
-  - /glcarb stepsize sigue ajustando solo los pasos numerados.
-  - /glcarb size queda como escala global base para flecha y pasos.
+Cambios v6:
+  - Corrige el falso positivo real observado en guias con pasos DO:.
+  - En modo smart se omiten los GOTO/LOC dinamicos que Guidelime genera desde
+    objetivos de mision, mobs, items u objetos, porque Carbonite/Questie ya los muestran.
+  - Anota los mapIcons envolviendo M.addMapIcon para distinguir ruta real de objetivo.
+  - La flecha ya no acepta elementos attached/objective salvo ACCEPT/TURNIN.
 
 Instalacion:
   1) Copia este archivo dentro de: Interface\AddOns\Guidelime\
@@ -35,19 +36,22 @@ Comandos:
   /glcarb arrowsize 1.20 Flecha un 20% mas grande sin tocar pasos numerados.
   /glcarb arrow on      Muestra el primer punto activo/flecha verde de Guidelime.
   /glcarb arrow off     Oculta ese pin adicional.
+  /glcarb arrowmode route Solo usa como flecha los waypoints de ruta GOTO/LOC. Recomendado.
+  /glcarb arrowmode any  Comportamiento antiguo: acepta cualquier arrowFrame.element.
   /glcarb debug         Muestra tipos encontrados en addon.M.mapIcons.
 
 Notas tecnicas:
   - Debe cargarse dentro del addon Guidelime porque addon.M.mapIcons no es una API global publica.
   - Convierte mapID+x/y de Guidelime a coordenadas mundo de Carbonite con Nx.Map:GetWorldPos().
   - Copia el texcoord del atlas de Guidelime para conservar los numeros 1,2,3...
+  - Por defecto, solo convierte en flecha los waypoints de ruta GOTO/LOC.
 --]]
 
 local addonName, addon = ...
 if addonName ~= "Guidelime" or type(addon) ~= "table" then return end
 
 local BRIDGE_NAME = "GuidelimeCarboniteBridge"
-local VERSION = "v5"
+local VERSION = "v6"
 
 local MAX_MAP_INDEX = 58
 local SPECIAL_MAP_INDEX = {
@@ -74,12 +78,18 @@ local SMART_TYPES = {
 local provider
 local installed = false
 local hooked = false
+local addMapIconWrapped = false
 local syncPending = false
 local warnedNoCarbonite = false
 local lastCount = 0
 local lastArrowCount = 0
 local lastTypeCounts = {}
 local lastSkipped = 0
+local lastRouteArrowFromMapIcons = 0
+local lastRouteArrowPos = nil
+local lastArrowSource = ""
+local lastRawArrowType = ""
+local lastArrowSkipReason = ""
 local frame = CreateFrame("Frame")
 
 local function printMsg(msg)
@@ -134,6 +144,10 @@ local function ensureDB()
         -- 1.00 = flecha con el tamaño visual base. No afecta a los pasos numerados.
         GuidelimeData.carboniteBridgeArrowSizeScale = 1.00
     end
+    if GuidelimeData.carboniteBridgeArrowMode == nil then
+        -- route = solo GOTO/LOC; evita mostrar como flecha el objetivo activo de una mision.
+        GuidelimeData.carboniteBridgeArrowMode = "route"
+    end
 end
 
 local function bridgeEnabled()
@@ -164,6 +178,82 @@ end
 local function bridgeShowArrowPin()
     ensureDB()
     return GuidelimeData.carboniteBridgeShowArrowPin ~= false
+end
+
+local function bridgeArrowMode()
+    ensureDB()
+    local mode = tostring(GuidelimeData.carboniteBridgeArrowMode or "route"):lower()
+    if mode ~= "route" and mode ~= "any" then mode = "route" end
+    return mode
+end
+
+local function safeUpper(v)
+    if v == nil then return "" end
+    return string.upper(tostring(v))
+end
+
+local function stepLooksLikeDo(step)
+    if type(step) ~= "table" then return false end
+
+    local fields = {
+        step.action, step.command, step.cmd, step.t, step.typ, step.type, step.keyword, step.tag, step.mode
+    }
+    for _, v in ipairs(fields) do
+        local u = safeUpper(v)
+        if u == "DO" or u == "COMPLETE" or u == "OBJECTIVE" then
+            return true
+        end
+    end
+
+    -- Fallback conservador: solo para textos que empiezan claramente por DO:.
+    -- No se usa para ACCEPT/TURNIN.
+    local txt
+    if addon.CG and type(addon.CG.getStepText) == "function" then
+        local ok, r = pcall(addon.CG.getStepText, step)
+        if ok then txt = r end
+    end
+    if type(txt) == "string" and txt:match("^%s*[Dd][Oo]%s*:") then
+        return true
+    end
+
+    return false
+end
+
+local function isQuestObjectiveElement(e)
+    if type(e) ~= "table" then return false end
+
+    local attached = e.attached
+    local attachedT = attached and safeUpper(attached.t) or ""
+    local markerTyp = safeUpper(e.markerTyp)
+    local et = safeUpper(e.t)
+    local eType = safeUpper(e.type)
+
+    -- ACCEPT/TURNIN/npc son pasos de ruta útiles; no se consideran objetivos DO.
+    if attachedT == "ACCEPT" or attachedT == "TURNIN" or markerTyp == "ACCEPT" or markerTyp == "TURNIN" or et == "ACCEPT" or et == "TURNIN" then
+        return false
+    end
+
+    -- Guidelime genera posiciones dinamicas de misiones para pasos DO mediante
+    -- element.attached / element.objectives / element.type. Esos puntos ya los cubre
+    -- Carbonite/Questie y no deben convertirse en flecha de ruta.
+    if eType == "COLLECT_ITEM" or eType == "TARGET" or eType == "KILL" or eType == "LOOT" then
+        return true
+    end
+    if attached then
+        if attached.objective ~= nil or attached.finished ~= nil then return true end
+        if attachedT ~= "" and attachedT ~= "ACCEPT" and attachedT ~= "TURNIN" then return true end
+    end
+    if e.objectives ~= nil or e.objective ~= nil or e.objectId ~= nil or e.itemId ~= nil then
+        return true
+    end
+
+    -- Si el elemento pertenece a un paso DO:, aunque sea t=GOTO/LOC, lo tratamos
+    -- como objetivo de mision, no como waypoint de ruta.
+    if stepLooksLikeDo(e.step) then
+        return true
+    end
+
+    return false
 end
 
 local function hasCarboniteProviderAPI()
@@ -284,6 +374,11 @@ local function clearProvider()
     lastCount = 0
     lastArrowCount = 0
     lastSkipped = 0
+    lastRouteArrowFromMapIcons = 0
+    lastRouteArrowPos = nil
+    lastArrowSource = ""
+    lastRawArrowType = ""
+    lastArrowSkipReason = ""
     wipe(lastTypeCounts)
 end
 
@@ -320,6 +415,19 @@ local function shouldMirrorType(t)
 
     local st = styleTypeFor(t)
     if GuidelimeData and GuidelimeData["showMapMarkers" .. st] == false then
+        return false
+    end
+
+    return true
+end
+
+local function shouldMirrorMapIcon(t, mapIcon)
+    if not shouldMirrorType(t) then return false end
+
+    -- En modo smart no copiamos objetivos DO generados dinamicamente desde
+    -- misiones/mobs/items/objects. Esos puntos ya los muestra Carbonite/Questie
+    -- y, si se copian como index 0, parecen una segunda flecha de Guidelime.
+    if bridgeMode() == "smart" and mapIcon and isQuestObjectiveElement(mapIcon._glcarbElement) then
         return false
     end
 
@@ -396,8 +504,19 @@ local function carboniteWorldPos(mapID, x, y)
     return nil
 end
 
-local function pinKind(mapIcon, useWorld)
+local function isRouteArrowType(t)
+    return t == "GOTO" or t == "LOC"
+end
+
+local function isRouteActiveMarker(t, mapIcon)
+    return isRouteArrowType(t) and mapIcon and tonumber(mapIcon.index) == 0
+end
+
+local function pinKind(mapIcon, useWorld, t)
     local active = mapIcon and tonumber(mapIcon.index) == 0
+    if isRouteActiveMarker(t, mapIcon) and not isQuestObjectiveElement(mapIcon._glcarbElement) then
+        return useWorld and "ArrowWP" or "ArrowZP"
+    end
     if useWorld then
         return active and "StepActiveWP" or "StepWP"
     end
@@ -423,7 +542,7 @@ end
 
 local function addCarbonitePin(p, t, mapIcon)
     if type(mapIcon) ~= "table" or not mapIcon.inUse then return false end
-    if not shouldMirrorType(t) then return false end
+    if not shouldMirrorMapIcon(t, mapIcon) then return false end
 
     local mapID = tonumber(mapIcon.mapID)
     local x = tonumber(mapIcon.x)
@@ -431,8 +550,20 @@ local function addCarbonitePin(p, t, mapIcon)
     if not mapID or not x or not y then return false end
 
     local st = styleTypeFor(t)
-    local tx1, ty1, tx2, ty2 = texCoordsForMarker(t, mapIcon.index)
-    local active = tonumber(mapIcon.index) == 0
+    local routeActive = isRouteActiveMarker(t, mapIcon) and not isQuestObjectiveElement(mapIcon._glcarbElement)
+    local tx1, ty1, tx2, ty2
+    local size
+
+    if routeActive then
+        -- El indice 0 de GOTO/LOC es la flecha verde real de ruta. Usa arrowsize,
+        -- no stepsize, y no lo trates como un paso numerado normal.
+        tx1, ty1, tx2, ty2 = texCoordsForMarker("GOTO", 0)
+        size = arrowDisplaySize()
+    else
+        tx1, ty1, tx2, ty2 = texCoordsForMarker(t, mapIcon.index)
+        size = stepDisplaySize(st, tonumber(mapIcon.index) == 0)
+    end
+
     local opts = {
         mapID = mapID,
         tip = getTooltip(mapIcon),
@@ -441,31 +572,68 @@ local function addCarbonitePin(p, t, mapIcon)
         ty1 = ty1,
         tx2 = tx2,
         ty2 = ty2,
-        w = stepDisplaySize(st, active),
-        h = stepDisplaySize(st, active),
+        w = size,
+        h = size,
         color = alphaColor(defaultAlpha(st)),
-        userData = { source = "Guidelime", type = t, index = mapIcon.index, mapID = mapID, x = x, y = y },
+        userData = { source = "Guidelime", type = routeActive and "ARROW_MAPICON" or t, index = mapIcon.index, mapID = mapID, x = x, y = y },
     }
 
-    return addPinAt(p, pinKind(mapIcon, true), pinKind(mapIcon, false), mapID, x, y, opts)
+    local added = addPinAt(p, pinKind(mapIcon, true, t), pinKind(mapIcon, false, t), mapID, x, y, opts)
+    if added and routeActive then
+        lastRouteArrowFromMapIcons = lastRouteArrowFromMapIcons + 1
+        lastRouteArrowPos = { mapID = mapID, x = x, y = y }
+    end
+    return added
+end
+
+local function elementHasMapPos(e)
+    return type(e) == "table" and e.mapID and e.x and e.y
+end
+
+local function arrowElementAllowed(e)
+    if not elementHasMapPos(e) then return false end
+    if bridgeArrowMode() == "any" then return true end
+    return isRouteArrowType(e.t) and not isQuestObjectiveElement(e)
+end
+
+local function sameMapPoint(a, b)
+    if not a or not b then return false end
+    if tonumber(a.mapID) ~= tonumber(b.mapID) then return false end
+    local ax, ay = tonumber(a.x), tonumber(a.y)
+    local bx, by = tonumber(b.x), tonumber(b.y)
+    if not ax or not ay or not bx or not by then return false end
+    local tol = (ax > 1 or ay > 1 or bx > 1 or by > 1) and 0.10 or 0.001
+    return math.abs(ax - bx) <= tol and math.abs(ay - by) <= tol
 end
 
 local function getArrowElement()
     local M = addon.M
+    lastArrowSource = ""
+    lastRawArrowType = ""
+    lastArrowSkipReason = ""
+
     if type(M) ~= "table" then return nil end
 
     if M.arrowFrame and type(M.arrowFrame.element) == "table" then
         local e = M.arrowFrame.element
-        if e.mapID and e.x and e.y then return e end
+        lastRawArrowType = tostring(e.t)
+        if arrowElementAllowed(e) then
+            lastArrowSource = "arrowFrame.element"
+            return e
+        elseif elementHasMapPos(e) then
+            lastArrowSkipReason = "arrowFrame.element omitido: t=" .. tostring(e.t) .. ", attached=" .. tostring(e.attached and e.attached.t) .. ", type=" .. tostring(e.type) .. ", do/objective=" .. tostring(isQuestObjectiveElement(e)) .. ", arrowmode=" .. bridgeArrowMode()
+        end
     end
 
-    -- Fallback: si el frame de flecha aun no existe, busca el paso activo actual.
+    -- Fallback: busca solo un waypoint de ruta real. En v5 tambien aceptaba
+    -- ACCEPT/TURNIN y eso podia convertir el objetivo activo de mision en flecha.
     local CG = addon.CG
     if type(CG) == "table" and type(CG.currentGuide) == "table" and type(CG.currentGuide.steps) == "table" then
         for _, step in ipairs(CG.currentGuide.steps) do
             if not step.skip and not step.completed and step.available and step.active and type(step.elements) == "table" then
                 for _, element in ipairs(step.elements) do
-                    if not element.completed and element.mapID and element.x and element.y and (element.t == "GOTO" or element.t == "LOC" or element.t == "ACCEPT" or element.t == "TURNIN") then
+                    if not element.completed and arrowElementAllowed(element) then
+                        lastArrowSource = "active guide step"
                         return element
                     end
                 end
@@ -473,6 +641,7 @@ local function getArrowElement()
         end
     end
 
+    if lastArrowSkipReason == "" then lastArrowSkipReason = "sin waypoint de ruta GOTO/LOC" end
     return nil
 end
 
@@ -481,6 +650,11 @@ local function addArrowPin(p)
 
     local element = getArrowElement()
     if type(element) ~= "table" then return 0 end
+
+    if bridgeArrowMode() == "route" and lastRouteArrowPos and sameMapPoint(element, lastRouteArrowPos) then
+        lastArrowSkipReason = "arrowFrame omitido: la flecha de ruta ya venia de mapIcons"
+        return 0
+    end
 
     local mapID = tonumber(element.mapID)
     local x = tonumber(element.x)
@@ -544,6 +718,11 @@ local function syncNow()
     wipe(lastTypeCounts)
     lastSkipped = 0
     lastArrowCount = 0
+    lastRouteArrowFromMapIcons = 0
+    lastRouteArrowPos = nil
+    lastArrowSource = ""
+    lastRawArrowType = ""
+    lastArrowSkipReason = ""
 
     local count = 0
     for t, icons in pairs(M.mapIcons) do
@@ -596,10 +775,40 @@ local function scheduleSync(delay)
     later(delay or 0.05, syncNow)
 end
 
+local function wrapGuidelimeAddMapIcon()
+    local M = addon.M
+    if addMapIconWrapped or type(M) ~= "table" or type(M.addMapIcon) ~= "function" then return end
+    addMapIconWrapped = true
+
+    local originalAddMapIcon = M.addMapIcon
+    M.addMapIcon = function(element, highlight, ignoreMaxNumOfMarkers)
+        local a, b, c, d, e = originalAddMapIcon(element, highlight, ignoreMaxNumOfMarkers)
+
+        if type(element) == "table" and element.mapIndex ~= nil and type(M.mapIcons) == "table" then
+            local iconType = element.markerTyp or element.t
+            local icons = M.mapIcons[iconType]
+            local mapIcon = type(icons) == "table" and icons[element.mapIndex]
+            if type(mapIcon) == "table" then
+                mapIcon._glcarbElement = element
+                mapIcon._glcarbHighlight = highlight and true or false
+                mapIcon._glcarbElementT = element.t
+                mapIcon._glcarbMarkerTyp = element.markerTyp
+                mapIcon._glcarbAttachedT = element.attached and element.attached.t
+                mapIcon._glcarbElementType = element.type
+                mapIcon._glcarbStepActive = element.step and element.step.active
+                mapIcon._glcarbIsQuestObjective = isQuestObjectiveElement(element)
+            end
+        end
+
+        return a, b, c, d, e
+    end
+end
+
 local function installBridge()
     if installed then return true end
     if type(addon.M) ~= "table" then return false end
     if not ensureProvider() then return false end
+    wrapGuidelimeAddMapIcon()
 
     if not hooked then
         hooked = true
@@ -650,7 +859,7 @@ local function installBridge()
 
     installed = true
     warnedNoCarbonite = false
-    printMsg("puente activo en modo " .. bridgeMode() .. ", size=" .. string.format("%.2f", bridgeSizeScale()) .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale()) .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. ", arrow=" .. tostring(bridgeShowArrowPin()) .. ".")
+    printMsg("puente activo en modo " .. bridgeMode() .. ", size=" .. string.format("%.2f", bridgeSizeScale()) .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale()) .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. ", arrow=" .. tostring(bridgeShowArrowPin()) .. ", arrowmode=" .. bridgeArrowMode() .. ".")
 
     updateStepsMapIconsSafe()
     scheduleSync(0.20)
@@ -692,14 +901,28 @@ local function debugMapIcons()
                 end
             end
         end
-        printMsg("tipo " .. tostring(t) .. ": total=" .. total .. ", inUse=" .. inUse .. ", mirror=" .. tostring(shouldMirrorType(t)))
+        printMsg("tipo " .. tostring(t) .. ": total=" .. total .. ", inUse=" .. inUse .. ", mirrorTipo=" .. tostring(shouldMirrorType(t)))
+        if type(icons) == "table" then
+            for i, icon in pairs(icons) do
+                if type(icon) == "table" and icon.inUse and icon._glcarbIsQuestObjective then
+                    printMsg("  omitido smart candidato: tipo=" .. tostring(t) .. ", index=" .. tostring(i) .. ", e.t=" .. tostring(icon._glcarbElementT) .. ", markerTyp=" .. tostring(icon._glcarbMarkerTyp) .. ", attached=" .. tostring(icon._glcarbAttachedT) .. ", e.type=" .. tostring(icon._glcarbElementType) .. ", stepActive=" .. tostring(icon._glcarbStepActive))
+                end
+            end
+        end
+    end
+
+    local raw = addon.M and addon.M.arrowFrame and addon.M.arrowFrame.element
+    if raw then
+        printMsg("raw arrowFrame.element: t=" .. tostring(raw.t) .. ", attached=" .. tostring(raw.attached and raw.attached.t) .. ", e.type=" .. tostring(raw.type) .. ", do/objective=" .. tostring(isQuestObjectiveElement(raw)) .. ", mapID=" .. tostring(raw.mapID) .. ", x=" .. tostring(raw.x) .. ", y=" .. tostring(raw.y) .. ", routeAllowed=" .. tostring(arrowElementAllowed(raw)))
+    else
+        printMsg("raw arrowFrame.element: no encontrado")
     end
 
     local ae = getArrowElement()
     if ae then
-        printMsg("arrowElement: t=" .. tostring(ae.t) .. ", mapID=" .. tostring(ae.mapID) .. ", x=" .. tostring(ae.x) .. ", y=" .. tostring(ae.y) .. ", completed=" .. tostring(ae.completed))
+        printMsg("selected arrowElement: t=" .. tostring(ae.t) .. ", attached=" .. tostring(ae.attached and ae.attached.t) .. ", e.type=" .. tostring(ae.type) .. ", do/objective=" .. tostring(isQuestObjectiveElement(ae)) .. ", source=" .. tostring(lastArrowSource) .. ", mapID=" .. tostring(ae.mapID) .. ", x=" .. tostring(ae.x) .. ", y=" .. tostring(ae.y) .. ", completed=" .. tostring(ae.completed))
     else
-        printMsg("arrowElement: no encontrado")
+        printMsg("selected arrowElement: no encontrado; reason=" .. tostring(lastArrowSkipReason))
     end
 end
 
@@ -712,6 +935,7 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
     local stepSizeArg = msg:match("^stepsize%s+([%d%.]+)$") or msg:match("^stepscale%s+([%d%.]+)$")
     local arrowSizeArg = msg:match("^arrowsize%s+([%d%.]+)$") or msg:match("^arrowscale%s+([%d%.]+)$")
     local arrowArg = msg:match("^arrow%s+(%S+)$")
+    local arrowModeArg = msg:match("^arrowmode%s+(%S+)$") or msg:match("^arrowtarget%s+(%S+)$")
 
     if msg == "on" then
         GuidelimeData.carboniteBridgeEnabled = true
@@ -764,6 +988,18 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
         updateStepsMapIconsSafe()
         scheduleSync(0.05)
         printMsg("arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. "; solo flecha/primer punto activo. Refrescando iconos.")
+    elseif arrowModeArg == "route" or arrowModeArg == "safe" then
+        GuidelimeData.carboniteBridgeArrowMode = "route"
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("arrowmode=route: solo GOTO/LOC; evita convertir objetivos activos de mision en flecha.")
+    elseif arrowModeArg == "any" or arrowModeArg == "legacy" then
+        GuidelimeData.carboniteBridgeArrowMode = "any"
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("arrowmode=any: comportamiento antiguo; acepta cualquier arrowFrame.element.")
+    elseif msg == "arrowmode" or msg == "arrowtarget" then
+        printMsg("arrowmode=" .. bridgeArrowMode() .. ". Usa /glcarb arrowmode route recomendado, o /glcarb arrowmode any para el comportamiento antiguo.")
     elseif arrowArg == "on" or arrowArg == "1" or arrowArg == "true" then
         GuidelimeData.carboniteBridgeShowArrowPin = true
         updateStepsMapIconsSafe()
@@ -780,17 +1016,22 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
             .. ", size=" .. string.format("%.2f", bridgeSizeScale())
             .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale())
             .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale())
+            .. ", arrowmode=" .. tostring(bridgeArrowMode())
             .. ", stepPx=" .. tostring(stepDisplaySize("GOTO", false))
             .. ", arrowPx=" .. tostring(arrowDisplaySize())
             .. ", arrow=" .. tostring(bridgeShowArrowPin())
             .. ", installed=" .. tostring(installed)
+            .. ", wrapped=" .. tostring(addMapIconWrapped)
             .. ", pins=" .. tostring(lastCount)
             .. ", arrowPins=" .. tostring(lastArrowCount)
+            .. ", routeArrowMapIcons=" .. tostring(lastRouteArrowFromMapIcons)
+            .. ", arrowSource=" .. tostring(lastArrowSource)
+            .. ", arrowSkip=" .. tostring(lastArrowSkipReason)
             .. ", skipped=" .. tostring(lastSkipped)
             .. ", carboniteAPI=" .. tostring(hasCarboniteProviderAPI())
             .. ", tipos={" .. typeCountString() .. "}")
     else
-        printMsg("comandos: /glcarb on | off | smart | all | refresh | status | debug | size 1.60 | stepsize 1.00 | arrowsize 1.00 | arrow on|off")
+        printMsg("comandos: /glcarb on | off | smart | all | refresh | status | debug | size 1.60 | stepsize 1.00 | arrowsize 1.00 | arrow on|off | arrowmode route|any")
     end
 end
 
