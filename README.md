@@ -98,6 +98,8 @@ Guidelime_CarboniteBridge.lua
 | `/glcarb arrowsize 1.20` | Makes the active arrow marker larger without changing numbered step markers.                                                 |
 | `/glcarb arrow on`       | Shows the active Guidelime arrow/next-step marker on Carbonite.                                                              |
 | `/glcarb arrow off`      | Hides the active Guidelime arrow/next-step marker from Carbonite.                                                            |
+| `/glcarb arrowmode route` | Recommended mode. Only mirrors real route waypoint arrows and avoids objective/DO markers as active arrows. |
+| `/glcarb arrowmode any` | Diagnostic/legacy mode. Allows any Guidelime arrow element, which may duplicate objective arrows. |
 
 ## Size logic
 
@@ -184,6 +186,18 @@ Please report issues with:
 
 * WoW client version.
 * Guidelime version.
+
+## Latest version
+
+Current release: `v6.0.0`
+
+This version fixes a false active-arrow issue where some Guidelime `DO:` quest objective steps could be mirrored into Carbonite as an additional green arrow.
+
+The bridge now separates real route waypoints from dynamic quest objective markers, so Carbonite shows:
+
+- Guidelime numbered route markers.
+- The real active route arrow/waypoint.
+- No duplicate active arrow for `DO:` objective steps already handled by Questie/Carbonite.X
 * Carbonite version.
 * Questie version, if installed.
 * Output from `/glcarb status`.
