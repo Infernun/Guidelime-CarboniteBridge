@@ -1,5 +1,5 @@
 --[[
-Guidelime_CarboniteBridge.lua v6
+Guidelime_CarboniteBridge.lua v6.1.0
 
 Objetivo:
   Mostrar en el mapa de Carbonite los marcadores numerados de pasos de Guidelime
@@ -11,6 +11,22 @@ Cambios v6:
     objetivos de mision, mobs, items u objetos, porque Carbonite/Questie ya los muestran.
   - Anota los mapIcons envolviendo M.addMapIcon para distinguir ruta real de objetivo.
   - La flecha ya no acepta elementos attached/objective salvo ACCEPT/TURNIN.
+  - v6.0.2-test: vuelve a mostrar los DO como marcador normal, pero nunca como flecha.
+  - v6.0.3-test: los DO pueden mostrarse como flecha activa hasta llegar a sus coordenadas;
+    se suprime la flecha de ruta paralela para evitar dos flechas verdes.
+  - v6.0.4-test: conserva el indice/numero original de los DO no activos para que
+    los marcadores 1,2,3,4 sigan mostrando su numero dentro del icono.
+  - v6.0.5-test: elimina el refresco periodico destructivo; la sincronizacion normal
+    se hace con los mismos hooks/eventos de Guidelime y el watcher del DO solo refresca
+    una vez cuando detecta que has llegado al arrowWP.
+  - v6.0.6-test: imita mejor el comportamiento nativo de Guidelime: el DO activo
+    se toma preferentemente desde el mapIcon resaltado index=0 que Guidelime ya crea,
+    usando la misma celda de atlas, y el watcher de llegada usa radio/coordenadas mundo
+    cuando estan disponibles.
+  - v6.1.0: elimina la vigilancia periodica de llegada del puente y sincroniza
+    Carbonite solo despues de M.updateStepsMapIcons(), que es el mismo metodo que
+    Guidelime usa para reconstruir el mapa original. Esto evita Clear()+Add()+Refresh
+    repetidos y reduce el parpadeo.
 
 Instalacion:
   1) Copia este archivo dentro de: Interface\AddOns\Guidelime\
@@ -38,6 +54,8 @@ Comandos:
   /glcarb arrow off     Oculta ese pin adicional.
   /glcarb arrowmode route Solo usa como flecha los waypoints de ruta GOTO/LOC. Recomendado.
   /glcarb arrowmode any  Comportamiento antiguo: acepta cualquier arrowFrame.element.
+  /glcarb doarrow on    Muestra el DO activo como flecha temporal hasta llegar a sus coordenadas.
+  /glcarb arrive 0.007 Distancia normalizada para ocultar la flecha DO al llegar.
   /glcarb debug         Muestra tipos encontrados en addon.M.mapIcons.
 
 Notas tecnicas:
@@ -51,7 +69,7 @@ local addonName, addon = ...
 if addonName ~= "Guidelime" or type(addon) ~= "table" then return end
 
 local BRIDGE_NAME = "GuidelimeCarboniteBridge"
-local VERSION = "v6"
+local VERSION = "v6.1.0"
 
 local MAX_MAP_INDEX = 58
 local SPECIAL_MAP_INDEX = {
@@ -90,6 +108,13 @@ local lastRouteArrowPos = nil
 local lastArrowSource = ""
 local lastRawArrowType = ""
 local lastArrowSkipReason = ""
+local lastSyncSignature = nil
+local activeArrowElementForSync = nil
+local activeArrowObjectiveForSync = false
+local sameMapPoint
+local doArrowWatchActive = false
+local doArrowWatchElapsed = 0
+local doArrowWatchElement = nil
 local frame = CreateFrame("Frame")
 
 local function printMsg(msg)
@@ -148,6 +173,18 @@ local function ensureDB()
         -- route = solo GOTO/LOC; evita mostrar como flecha el objetivo activo de una mision.
         GuidelimeData.carboniteBridgeArrowMode = "route"
     end
+    if GuidelimeData.carboniteBridgeShowDOMarkers == nil then
+        -- true = muestra los DO/objetivos de Guidelime como marcadores normales cuando no son la flecha activa.
+        GuidelimeData.carboniteBridgeShowDOMarkers = true
+    end
+    if GuidelimeData.carboniteBridgeDoArrow == nil then
+        -- true = el DO activo de Guidelime se muestra como flecha temporal en Carbonite.
+        GuidelimeData.carboniteBridgeDoArrow = true
+    end
+    if GuidelimeData.carboniteBridgeArrivalRadius == nil then
+        -- Coordenadas normalizadas de mapa. 0.007 = 0.7% del mapa aprox.
+        GuidelimeData.carboniteBridgeArrivalRadius = 0.007
+    end
 end
 
 local function bridgeEnabled()
@@ -185,6 +222,21 @@ local function bridgeArrowMode()
     local mode = tostring(GuidelimeData.carboniteBridgeArrowMode or "route"):lower()
     if mode ~= "route" and mode ~= "any" then mode = "route" end
     return mode
+end
+
+local function bridgeShowDOMarkers()
+    ensureDB()
+    return GuidelimeData.carboniteBridgeShowDOMarkers ~= false
+end
+
+local function bridgeDoArrow()
+    ensureDB()
+    return GuidelimeData.carboniteBridgeDoArrow ~= false
+end
+
+local function bridgeArrivalRadius()
+    ensureDB()
+    return clamp(GuidelimeData.carboniteBridgeArrivalRadius, 0.001, 0.050) or 0.007
 end
 
 local function safeUpper(v)
@@ -379,6 +431,7 @@ local function clearProvider()
     lastArrowSource = ""
     lastRawArrowType = ""
     lastArrowSkipReason = ""
+    lastSyncSignature = nil
     wipe(lastTypeCounts)
 end
 
@@ -424,11 +477,11 @@ end
 local function shouldMirrorMapIcon(t, mapIcon)
     if not shouldMirrorType(t) then return false end
 
-    -- En modo smart no copiamos objetivos DO generados dinamicamente desde
-    -- misiones/mobs/items/objects. Esos puntos ya los muestra Carbonite/Questie
-    -- y, si se copian como index 0, parecen una segunda flecha de Guidelime.
+    -- En modo smart los DO/objetivos dinamicos NO se convierten en flecha,
+    -- pero se pueden mostrar como marcador normal para saber hacia donde ir.
+    -- Esto evita la doble flecha verde sin ocultar el DO antes de llegar a la zona.
     if bridgeMode() == "smart" and mapIcon and isQuestObjectiveElement(mapIcon._glcarbElement) then
-        return false
+        return bridgeShowDOMarkers()
     end
 
     return true
@@ -480,6 +533,96 @@ local function getCarboniteCurrentMapID()
     return nil
 end
 
+
+local function normalizeMapXY(x, y)
+    x = tonumber(x)
+    y = tonumber(y)
+    if not x or not y then return nil end
+    -- Guidelime suele usar 0..1. Si alguna guia/addon entrega 0..100, normaliza.
+    if x > 1 or y > 1 then
+        x = x / 100
+        y = y / 100
+    end
+    return x, y
+end
+
+local function getPlayerMapXY(mapID)
+    mapID = tonumber(mapID)
+    if not mapID or not C_Map or type(C_Map.GetPlayerMapPosition) ~= "function" then return nil end
+    local ok, pos = pcall(C_Map.GetPlayerMapPosition, mapID, "player")
+    if not ok or not pos then return nil end
+
+    if type(pos.GetXY) == "function" then
+        local ok2, px, py = pcall(function() return pos:GetXY() end)
+        if ok2 and tonumber(px) and tonumber(py) then return tonumber(px), tonumber(py) end
+    end
+    if tonumber(pos.x) and tonumber(pos.y) then return tonumber(pos.x), tonumber(pos.y) end
+    return nil
+end
+
+local hbdCache
+local function getHBD()
+    if hbdCache ~= nil then return hbdCache or nil end
+    if type(LibStub) == "function" then
+        local ok, lib = pcall(LibStub, "HereBeDragons-2.0", true)
+        if ok and lib then
+            hbdCache = lib
+            return hbdCache
+        end
+    end
+    hbdCache = false
+    return nil
+end
+
+local function getPlayerWorldPos()
+    local HBD = getHBD()
+    if HBD and type(HBD.GetPlayerWorldPosition) == "function" then
+        local ok, wx, wy, instance = pcall(function() return HBD:GetPlayerWorldPosition() end)
+        if ok and tonumber(wx) and tonumber(wy) then
+            return tonumber(wx), tonumber(wy), instance
+        end
+    end
+
+    if addon.D and tonumber(addon.D.wx) and tonumber(addon.D.wy) then
+        return tonumber(addon.D.wx), tonumber(addon.D.wy), addon.D.instance
+    end
+
+    return nil
+end
+
+local function playerReachedElement(e)
+    if type(e) ~= "table" then return false end
+
+    -- Guidelime decide que has llegado usando coordenadas mundo de HereBeDragons
+    -- y element.radius dentro de M.updateArrow(). Imitamos eso primero; es mas
+    -- fiable que comparar x/y normalizadas del mapa, especialmente con DO dinamicos.
+    if e.wx and e.wy then
+        local pwx, pwy, pinst = getPlayerWorldPos()
+        local ewx, ewy = tonumber(e.wx), tonumber(e.wy)
+        local radius = tonumber(e.radius)
+        if pwx and pwy and ewx and ewy and radius and radius > 0 then
+            local einst = e.instance
+            if einst == nil or pinst == nil or tonumber(einst) == tonumber(pinst) then
+                local dx = pwx - ewx
+                local dy = pwy - ewy
+                local dist = math.sqrt((dx * dx) + (dy * dy))
+                return dist < radius, dist
+            end
+        end
+    end
+
+    -- Respaldo para elementos sin wx/wy/radius: compara coordenadas de mapa.
+    if not e.mapID or not e.x or not e.y then return false end
+    local px, py = getPlayerMapXY(e.mapID)
+    if not px or not py then return false end
+    local ex, ey = normalizeMapXY(e.x, e.y)
+    if not ex or not ey then return false end
+    local dx = px - ex
+    local dy = py - ey
+    local dist = math.sqrt((dx * dx) + (dy * dy))
+    return dist <= bridgeArrivalRadius(), dist
+end
+
 local function carboniteWorldPos(mapID, x, y)
     mapID = tonumber(mapID)
     x = tonumber(x)
@@ -514,7 +657,12 @@ end
 
 local function pinKind(mapIcon, useWorld, t)
     local active = mapIcon and tonumber(mapIcon.index) == 0
-    if isRouteActiveMarker(t, mapIcon) and not isQuestObjectiveElement(mapIcon._glcarbElement) then
+
+    -- Guidelime usa el mapIcon resaltado index=0 como marcador activo en el mapa
+    -- original, tambien cuando el elemento activo es un DO dinamico. Carbonite debe
+    -- imitar ese mapIcon; por eso index=0 se dibuja como ArrowWP/ArrowZP aunque
+    -- venga de un objetivo, evitando crear una segunda flecha aparte.
+    if isRouteActiveMarker(t, mapIcon) then
         return useWorld and "ArrowWP" or "ArrowZP"
     end
     if useWorld then
@@ -550,36 +698,60 @@ local function addCarbonitePin(p, t, mapIcon)
     if not mapID or not x or not y then return false end
 
     local st = styleTypeFor(t)
-    local routeActive = isRouteActiveMarker(t, mapIcon) and not isQuestObjectiveElement(mapIcon._glcarbElement)
+    local objectiveMarker = isQuestObjectiveElement(mapIcon._glcarbElement)
+    local activeMapIcon = isRouteActiveMarker(t, mapIcon)
+    local routeActive = activeMapIcon and not objectiveMarker
+
+    -- Si arrowFrame.element es un DO, el comportamiento nativo de Guidelime NO es
+    -- ocultar el mapIcon: Guidelime crea un mapIcon resaltado index=0 y ademas
+    -- apunta la flecha hacia el mismo elemento. Por tanto conservamos el index=0
+    -- como fuente visual principal y solo omitimos duplicados normales en la misma
+    -- coordenada.
+    if activeArrowObjectiveForSync then
+        local here = { mapID = mapID, x = x, y = y }
+        if objectiveMarker and sameMapPoint(activeArrowElementForSync, here) and not activeMapIcon then
+            return false
+        end
+    end
+
     local tx1, ty1, tx2, ty2
     local size
+    local visualType = t
+    local visualStyle = st
+    local visualIndex = mapIcon.index
 
-    if routeActive then
-        -- El indice 0 de GOTO/LOC es la flecha verde real de ruta. Usa arrowsize,
-        -- no stepsize, y no lo trates como un paso numerado normal.
+    if activeMapIcon then
+        -- El index=0 de GOTO/LOC es exactamente el marcador resaltado que Guidelime
+        -- pone en el mapa original para el primer elemento activo, incluidos DO:.
+        -- No lo transformamos a LOC; si no, aparece la hoja verde vacia sin flecha.
         tx1, ty1, tx2, ty2 = texCoordsForMarker("GOTO", 0)
+        visualStyle = "GOTO"
         size = arrowDisplaySize()
     else
-        tx1, ty1, tx2, ty2 = texCoordsForMarker(t, mapIcon.index)
-        size = stepDisplaySize(st, tonumber(mapIcon.index) == 0)
+        -- Para marcadores DO no activos, conservar el indice original para no perder
+        -- los numeros 1,2,3,4 del atlas de Guidelime.
+        tx1, ty1, tx2, ty2 = texCoordsForMarker(visualType, visualIndex)
+        size = stepDisplaySize(visualStyle, false)
     end
 
     local opts = {
         mapID = mapID,
         tip = getTooltip(mapIcon),
-        tex = defaultMarkerTexture(st),
+        tex = defaultMarkerTexture(visualStyle),
         tx1 = tx1,
         ty1 = ty1,
         tx2 = tx2,
         ty2 = ty2,
         w = size,
         h = size,
-        color = alphaColor(defaultAlpha(st)),
-        userData = { source = "Guidelime", type = routeActive and "ARROW_MAPICON" or t, index = mapIcon.index, mapID = mapID, x = x, y = y },
+        color = alphaColor(defaultAlpha(visualStyle)),
+        userData = { source = "Guidelime", type = activeMapIcon and (objectiveMarker and "DO_ARROW_MAPICON" or "ARROW_MAPICON") or (objectiveMarker and "DO" or t), index = mapIcon.index, mapID = mapID, x = x, y = y },
     }
 
-    local added = addPinAt(p, pinKind(mapIcon, true, t), pinKind(mapIcon, false, t), mapID, x, y, opts)
-    if added and routeActive then
+    local kindWorld = pinKind(mapIcon, true, t)
+    local kindZone = pinKind(mapIcon, false, t)
+    local added = addPinAt(p, kindWorld, kindZone, mapID, x, y, opts)
+    if added and activeMapIcon then
         lastRouteArrowFromMapIcons = lastRouteArrowFromMapIcons + 1
         lastRouteArrowPos = { mapID = mapID, x = x, y = y }
     end
@@ -590,13 +762,23 @@ local function elementHasMapPos(e)
     return type(e) == "table" and e.mapID and e.x and e.y
 end
 
+local function isDoArrowElement(e)
+    return bridgeDoArrow() and elementHasMapPos(e) and isRouteArrowType(e.t) and isQuestObjectiveElement(e)
+end
+
 local function arrowElementAllowed(e)
     if not elementHasMapPos(e) then return false end
     if bridgeArrowMode() == "any" then return true end
+
+    -- Caso importante: en Guidelime, un paso DO puede usar arrowFrame.element como
+    -- destino temporal. En Carbonite debe verse como flecha hasta llegar a la zona,
+    -- pero no debe duplicarse con otra flecha de ruta.
+    if isDoArrowElement(e) then return true end
+
     return isRouteArrowType(e.t) and not isQuestObjectiveElement(e)
 end
 
-local function sameMapPoint(a, b)
+function sameMapPoint(a, b)
     if not a or not b then return false end
     if tonumber(a.mapID) ~= tonumber(b.mapID) then return false end
     local ax, ay = tonumber(a.x), tonumber(a.y)
@@ -618,7 +800,7 @@ local function getArrowElement()
         local e = M.arrowFrame.element
         lastRawArrowType = tostring(e.t)
         if arrowElementAllowed(e) then
-            lastArrowSource = "arrowFrame.element"
+            lastArrowSource = isQuestObjectiveElement(e) and "arrowFrame.element(DO)" or "arrowFrame.element"
             return e
         elseif elementHasMapPos(e) then
             lastArrowSkipReason = "arrowFrame.element omitido: t=" .. tostring(e.t) .. ", attached=" .. tostring(e.attached and e.attached.t) .. ", type=" .. tostring(e.type) .. ", do/objective=" .. tostring(isQuestObjectiveElement(e)) .. ", arrowmode=" .. bridgeArrowMode()
@@ -633,7 +815,7 @@ local function getArrowElement()
             if not step.skip and not step.completed and step.available and step.active and type(step.elements) == "table" then
                 for _, element in ipairs(step.elements) do
                     if not element.completed and arrowElementAllowed(element) then
-                        lastArrowSource = "active guide step"
+                        lastArrowSource = isQuestObjectiveElement(element) and "active guide step(DO)" or "active guide step"
                         return element
                     end
                 end
@@ -645,14 +827,32 @@ local function getArrowElement()
     return nil
 end
 
-local function addArrowPin(p)
+local function addArrowPin(p, selectedElement)
     if not bridgeShowArrowPin() then return 0 end
 
-    local element = getArrowElement()
+    local element = selectedElement or getArrowElement()
     if type(element) ~= "table" then return 0 end
 
+    local objectiveArrow = isQuestObjectiveElement(element)
+    if objectiveArrow then
+        local reached, dist = playerReachedElement(element)
+        if reached then
+            lastArrowSkipReason = "DO arrow oculto: Guidelime considera alcanzado el arrowWP; dist=" .. string.format("%.4f", dist or 0)
+            return 0
+        end
+    end
+
+    -- Si el mapIcon resaltado index=0 ya se ha copiado desde addon.M.mapIcons, no
+    -- creamos una segunda flecha desde arrowFrame.element. Esto imita el mapa
+    -- original: una unica marca activa en el mapa + la flecha direccional de Guidelime.
     if bridgeArrowMode() == "route" and lastRouteArrowPos and sameMapPoint(element, lastRouteArrowPos) then
-        lastArrowSkipReason = "arrowFrame omitido: la flecha de ruta ya venia de mapIcons"
+        lastArrowSkipReason = objectiveArrow
+            and "arrowFrame DO omitido: el mapIcon activo index=0 ya venia de mapIcons"
+            or "arrowFrame omitido: la flecha de ruta ya venia de mapIcons"
+        if objectiveArrow then
+            doArrowWatchActive = true
+            doArrowWatchElement = element
+        end
         return 0
     end
 
@@ -676,10 +876,14 @@ local function addArrowPin(p)
         w = size,
         h = size,
         color = alphaColor(defaultAlpha("GOTO")),
-        userData = { source = "Guidelime", type = "ARROW", index = 0, mapID = mapID, x = x, y = y },
+        userData = { source = "Guidelime", type = objectiveArrow and "DO_ARROW" or "ARROW", index = 0, mapID = mapID, x = x, y = y },
     }
 
     if addPinAt(p, "ArrowWP", "ArrowZP", mapID, x, y, opts) then
+        if objectiveArrow then
+            doArrowWatchActive = true
+            doArrowWatchElement = element
+        end
         return 1
     end
     return 0
@@ -689,6 +893,75 @@ local function updateStepsMapIconsSafe()
     if addon.M and type(addon.M.updateStepsMapIcons) == "function" then
         pcall(addon.M.updateStepsMapIcons)
     end
+end
+
+
+local function roundedCoord(v)
+    v = tonumber(v)
+    if not v then return "?" end
+    return string.format("%.5f", v)
+end
+
+local function buildSyncSignature(M, selectedArrow)
+    local out = {
+        "enabled=" .. tostring(bridgeEnabled()),
+        "mode=" .. bridgeMode(),
+        "arrow=" .. tostring(bridgeShowArrowPin()),
+        "arrowmode=" .. bridgeArrowMode(),
+        "do=" .. tostring(bridgeShowDOMarkers()),
+        "doarrow=" .. tostring(bridgeDoArrow()),
+        "arrive=" .. string.format("%.4f", bridgeArrivalRadius()),
+        "size=" .. string.format("%.3f", bridgeSizeScale()),
+        "stepsize=" .. string.format("%.3f", bridgeStepSizeScale()),
+        "arrowsize=" .. string.format("%.3f", bridgeArrowSizeScale()),
+    }
+
+    if type(M) == "table" and type(M.mapIcons) == "table" then
+        for t, icons in pairs(M.mapIcons) do
+            if type(icons) == "table" then
+                for i, icon in pairs(icons) do
+                    if type(icon) == "table" and icon.inUse then
+                        out[#out + 1] = table.concat({
+                            "m",
+                            tostring(t),
+                            tostring(i),
+                            tostring(icon.index),
+                            tostring(icon.mapID),
+                            roundedCoord(icon.x),
+                            roundedCoord(icon.y),
+                            tostring(icon._glcarbIsQuestObjective),
+                            tostring(icon._glcarbElementT),
+                            tostring(icon._glcarbMarkerTyp),
+                            tostring(icon._glcarbAttachedT),
+                            tostring(icon._glcarbElementType),
+                            tostring(icon._glcarbStepActive),
+                        }, ":")
+                    end
+                end
+            end
+        end
+    end
+
+    if type(selectedArrow) == "table" then
+        local reached = false
+        if isQuestObjectiveElement(selectedArrow) then
+            reached = playerReachedElement(selectedArrow) and true or false
+        end
+        out[#out + 1] = table.concat({
+            "a",
+            tostring(selectedArrow.t),
+            tostring(selectedArrow.mapID),
+            roundedCoord(selectedArrow.x),
+            roundedCoord(selectedArrow.y),
+            tostring(isQuestObjectiveElement(selectedArrow)),
+            tostring(reached),
+        }, ":")
+    else
+        out[#out + 1] = "a:nil"
+    end
+
+    table.sort(out)
+    return table.concat(out, "|")
 end
 
 local function syncNow()
@@ -714,6 +987,15 @@ local function syncNow()
         return
     end
 
+    local selectedArrow = getArrowElement()
+    local signature = buildSyncSignature(M, selectedArrow)
+    if signature == lastSyncSignature then
+        -- No hay cambios reales en Guidelime ni en la llegada al DO arrowWP.
+        -- Evita Clear()+Add() innecesarios en Carbonite, que son los que provocan parpadeos.
+        return
+    end
+    lastSyncSignature = signature
+
     p:Clear()
     wipe(lastTypeCounts)
     lastSkipped = 0
@@ -723,6 +1005,10 @@ local function syncNow()
     lastArrowSource = ""
     lastRawArrowType = ""
     lastArrowSkipReason = ""
+    activeArrowElementForSync = selectedArrow
+    activeArrowObjectiveForSync = type(activeArrowElementForSync) == "table" and isQuestObjectiveElement(activeArrowElementForSync) or false
+    doArrowWatchActive = false
+    doArrowWatchElement = nil
 
     local count = 0
     for t, icons in pairs(M.mapIcons) do
@@ -753,13 +1039,15 @@ local function syncNow()
         end
     end
 
-    lastArrowCount = addArrowPin(p)
+    lastArrowCount = addArrowPin(p, activeArrowElementForSync)
     if lastArrowCount > 0 then
         count = count + lastArrowCount
         lastTypeCounts.ARROW = (lastTypeCounts.ARROW or 0) + lastArrowCount
     end
 
     lastCount = count
+    activeArrowElementForSync = nil
+    activeArrowObjectiveForSync = false
 
     if p.Refresh then
         pcall(p.Refresh, p)
@@ -813,53 +1101,39 @@ local function installBridge()
     if not hooked then
         hooked = true
 
+        -- Modo nativo/sin parpadeo:
+        -- Guidelime reconstruye sus iconos del mapa original dentro de M.updateStepsMapIcons().
+        -- Esa funcion hace, en orden: removeMapIcons -> addMapIcon(...) -> showArrow(...) -> showMapIcons().
+        -- Por eso sincronizamos Carbonite SOLO al terminar updateStepsMapIcons(), no tambien
+        -- en showMapIcons/showArrow/hideArrow/CG.updateSteps ni en eventos de quest/zone.
         if type(addon.M.updateStepsMapIcons) == "function" then
             hooksecurefunc(addon.M, "updateStepsMapIcons", function()
-                scheduleSync(0.05)
-            end)
-        end
-
-        if type(addon.M.showMapIcons) == "function" then
-            hooksecurefunc(addon.M, "showMapIcons", function()
-                scheduleSync(0.05)
-            end)
-        end
-
-        if type(addon.M.showArrow) == "function" then
-            hooksecurefunc(addon.M, "showArrow", function()
-                scheduleSync(0.05)
-            end)
-        end
-
-        if type(addon.M.hideArrow) == "function" then
-            hooksecurefunc(addon.M, "hideArrow", function()
-                scheduleSync(0.05)
+                scheduleSync(0.01)
             end)
         end
 
         if type(addon.M.setMapIconTextures) == "function" then
             hooksecurefunc(addon.M, "setMapIconTextures", function()
                 -- Releer tamaño/alpha/texture si cambias opciones de Guidelime.
-                scheduleSync(0.05)
+                redefinePinsSafe()
+                scheduleSync(0.01)
             end)
         end
 
         if type(addon.M.removeMapIcons) == "function" then
             hooksecurefunc(addon.M, "removeMapIcons", function()
-                clearProvider()
-            end)
-        end
-
-        if addon.CG and type(addon.CG.updateSteps) == "function" then
-            hooksecurefunc(addon.CG, "updateSteps", function()
-                scheduleSync(0.10)
+                -- No limpiar Carbonite al instante: removeMapIcons() se llama al principio
+                -- de updateStepsMapIcons(), y limpiar aqui produce parpadeo. Programamos
+                -- una sincronizacion diferida; si Guidelime vuelve a llenar M.mapIcons,
+                -- se vera el nuevo estado, y si solo limpia, Carbonite quedara limpio.
+                scheduleSync(0.05)
             end)
         end
     end
 
     installed = true
     warnedNoCarbonite = false
-    printMsg("puente activo en modo " .. bridgeMode() .. ", size=" .. string.format("%.2f", bridgeSizeScale()) .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale()) .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. ", arrow=" .. tostring(bridgeShowArrowPin()) .. ", arrowmode=" .. bridgeArrowMode() .. ".")
+    printMsg("puente activo en modo " .. bridgeMode() .. ", size=" .. string.format("%.2f", bridgeSizeScale()) .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale()) .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. ", arrow=" .. tostring(bridgeShowArrowPin()) .. ", arrowmode=" .. bridgeArrowMode() .. ", do=" .. tostring(bridgeShowDOMarkers()) .. ", doarrow=" .. tostring(bridgeDoArrow()) .. ", arrive=" .. string.format("%.3f", bridgeArrivalRadius()) .. ", sync=native.")
 
     updateStepsMapIconsSafe()
     scheduleSync(0.20)
@@ -905,7 +1179,7 @@ local function debugMapIcons()
         if type(icons) == "table" then
             for i, icon in pairs(icons) do
                 if type(icon) == "table" and icon.inUse and icon._glcarbIsQuestObjective then
-                    printMsg("  omitido smart candidato: tipo=" .. tostring(t) .. ", index=" .. tostring(i) .. ", e.t=" .. tostring(icon._glcarbElementT) .. ", markerTyp=" .. tostring(icon._glcarbMarkerTyp) .. ", attached=" .. tostring(icon._glcarbAttachedT) .. ", e.type=" .. tostring(icon._glcarbElementType) .. ", stepActive=" .. tostring(icon._glcarbStepActive))
+                    printMsg("  DO/objetivo detectado: tipo=" .. tostring(t) .. ", index=" .. tostring(i) .. ", e.t=" .. tostring(icon._glcarbElementT) .. ", markerTyp=" .. tostring(icon._glcarbMarkerTyp) .. ", attached=" .. tostring(icon._glcarbAttachedT) .. ", e.type=" .. tostring(icon._glcarbElementType) .. ", stepActive=" .. tostring(icon._glcarbStepActive) .. ", mirrorDO=" .. tostring(bridgeShowDOMarkers()))
                 end
             end
         end
@@ -935,6 +1209,9 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
     local stepSizeArg = msg:match("^stepsize%s+([%d%.]+)$") or msg:match("^stepscale%s+([%d%.]+)$")
     local arrowSizeArg = msg:match("^arrowsize%s+([%d%.]+)$") or msg:match("^arrowscale%s+([%d%.]+)$")
     local arrowArg = msg:match("^arrow%s+(%S+)$")
+    local doArg = msg:match("^do%s+(%S+)$") or msg:match("^domarkers%s+(%S+)$")
+    local doArrowArg = msg:match("^doarrow%s+(%S+)$") or msg:match("^arrowdo%s+(%S+)$")
+    local arriveArg = msg:match("^arrive%s+([%d%.]+)$") or msg:match("^arrival%s+([%d%.]+)$")
     local arrowModeArg = msg:match("^arrowmode%s+(%S+)$") or msg:match("^arrowtarget%s+(%S+)$")
 
     if msg == "on" then
@@ -988,6 +1265,37 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
         updateStepsMapIconsSafe()
         scheduleSync(0.05)
         printMsg("arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale()) .. "; solo flecha/primer punto activo. Refrescando iconos.")
+    elseif doArrowArg == "on" or doArrowArg == "1" or doArrowArg == "true" then
+        GuidelimeData.carboniteBridgeDoArrow = true
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("DO arrow activado: el DO activo se muestra como flecha temporal hasta llegar a sus coordenadas.")
+    elseif doArrowArg == "off" or doArrowArg == "0" or doArrowArg == "false" then
+        GuidelimeData.carboniteBridgeDoArrow = false
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("DO arrow desactivado: los DO no se convierten en flecha activa.")
+    elseif msg == "doarrow" or msg == "arrowdo" then
+        printMsg("doarrow=" .. tostring(bridgeDoArrow()) .. ". Usa /glcarb doarrow on para mostrar el DO activo como flecha, o /glcarb doarrow off para desactivarlo.")
+    elseif arriveArg then
+        GuidelimeData.carboniteBridgeArrivalRadius = clamp(arriveArg, 0.001, 0.050) or 0.007
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("arrive=" .. string.format("%.3f", bridgeArrivalRadius()) .. "; radio normalizado para ocultar la flecha DO al llegar.")
+    elseif msg == "arrive" or msg == "arrival" then
+        printMsg("arrive=" .. string.format("%.3f", bridgeArrivalRadius()) .. ". Cambialo con /glcarb arrive 0.007. Rango: 0.001-0.050.")
+    elseif doArg == "on" or doArg == "1" or doArg == "true" then
+        GuidelimeData.carboniteBridgeShowDOMarkers = true
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("DO markers activados: se muestran como marcador normal cuando no son la flecha activa.")
+    elseif doArg == "off" or doArg == "0" or doArg == "false" then
+        GuidelimeData.carboniteBridgeShowDOMarkers = false
+        updateStepsMapIconsSafe()
+        scheduleSync(0.05)
+        printMsg("DO markers desactivados.")
+    elseif msg == "do" or msg == "domarkers" then
+        printMsg("do=" .. tostring(bridgeShowDOMarkers()) .. ". Usa /glcarb do on para mostrar DO como marcador normal cuando no son flecha activa, o /glcarb do off para ocultarlos.")
     elseif arrowModeArg == "route" or arrowModeArg == "safe" then
         GuidelimeData.carboniteBridgeArrowMode = "route"
         updateStepsMapIconsSafe()
@@ -1017,6 +1325,10 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
             .. ", stepsize=" .. string.format("%.2f", bridgeStepSizeScale())
             .. ", arrowsize=" .. string.format("%.2f", bridgeArrowSizeScale())
             .. ", arrowmode=" .. tostring(bridgeArrowMode())
+            .. ", do=" .. tostring(bridgeShowDOMarkers())
+            .. ", doarrow=" .. tostring(bridgeDoArrow())
+            .. ", arrive=" .. string.format("%.3f", bridgeArrivalRadius())
+            .. ", sync=native"
             .. ", stepPx=" .. tostring(stepDisplaySize("GOTO", false))
             .. ", arrowPx=" .. tostring(arrowDisplaySize())
             .. ", arrow=" .. tostring(bridgeShowArrowPin())
@@ -1031,19 +1343,20 @@ SlashCmdList.GLIME_CARBONITE_BRIDGE = function(msg)
             .. ", carboniteAPI=" .. tostring(hasCarboniteProviderAPI())
             .. ", tipos={" .. typeCountString() .. "}")
     else
-        printMsg("comandos: /glcarb on | off | smart | all | refresh | status | debug | size 1.60 | stepsize 1.00 | arrowsize 1.00 | arrow on|off | arrowmode route|any")
+        printMsg("comandos: /glcarb on | off | smart | all | refresh | status | debug | size 1.60 | stepsize 1.00 | arrowsize 1.00 | arrow on|off | arrowmode route|any | do on|off | doarrow on|off | arrive 0.007 | sync=native")
     end
 end
 
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
-frame:RegisterEvent("QUEST_ACCEPTED")
-frame:RegisterEvent("QUEST_TURNED_IN")
-frame:RegisterEvent("QUEST_REMOVED")
-frame:RegisterEvent("QUEST_LOG_UPDATE")
-frame:RegisterEvent("ZONE_CHANGED")
-frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-frame:RegisterEvent("ZONE_CHANGED_INDOORS")
+frame:SetScript("OnUpdate", function(_, elapsed)
+    -- v6.1.0: sin watcher periodico.
+    -- La llegada al DO/arrowWP la detecta Guidelime en M.updateArrow(); cuando Guidelime
+    -- cambia/libera el paso llama a CG.updateSteps(), y CG.updateSteps reconstruye el mapa
+    -- original mediante M.updateStepsMapIcons(). Nuestro hook sobre updateStepsMapIcons()
+    -- sincroniza Carbonite justo despues, imitando el flujo nativo.
+end)
+
 frame:SetScript("OnEvent", function(_, event, loadedAddon)
     if event == "ADDON_LOADED" then
         if loadedAddon == "Carbonite" or loadedAddon == "CarboniteAllinOneRetailClassic" or loadedAddon == "Guidelime" then
@@ -1054,12 +1367,9 @@ frame:SetScript("OnEvent", function(_, event, loadedAddon)
 
     if event == "PLAYER_LOGIN" then
         tryInstallSoon()
+        -- Sincronizacion inicial por seguridad; a partir de aqui manda Guidelime.
         scheduleSync(0.50)
         return
-    end
-
-    if installed then
-        scheduleSync(0.25)
     end
 end)
 
